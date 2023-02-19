@@ -203,9 +203,23 @@ def copy_blocks(mba, ori_blocks):
         elif newblk.tail and must_mcode_close_block(newblk.tail.opcode, True): # Case 2 - must-end opcode blocks
             # these blocks cannot be patched, we mark the fallthrough block as end instead
             if not oriblk_id + 1 in ori_block_id:
-                if newblk.tail.is_tailcall() or newblk.tail.opcode == m_ijmp: # return-like instructions
+                # Check if it's return-like instructions
+                #  Type1: ijmp   cs.2, lr.4 / ijmp   cs.2, pc.4
+                #  Type2: icall  cs.2, pc.4 (Type transformed by build_graph)
+
+                # The last instruction of ret-block (usually return insn) will be nop-ed and change to goto,
+                # so we have to assure where ret-insn are
+                if newblk.tail.opcode == m_icall and newblk.tail.is_tailcall(): #
+                    # Type2: returns here
                     flow_ends.ret.append(newblk)
+                elif newblk.tail.opcode == m_ijmp:
+                    # Type1: returns here
+                    flow_ends.ret.append(newblk)
+                elif newblk.tail.is_tailcall():
+                    # For real tailcall, flow returns in fallthrough block
+                    flow_ends.ret.append(mba.get_mblock(newblk.serial + 1))
                 else:
+                    # For others, they are fallthroughs
                     flow_ends.fallthrough.append(mba.get_mblock(newblk.serial + 1))
             pass
         else: # Case 1 - simple blocks
@@ -220,7 +234,7 @@ def copy_blocks(mba, ori_blocks):
 
 class MbaTransformer(object):
     def __init__(self, mba):
-        self.mba = mba
+        self.mba = mba # type: mba_t
     
     def prepare_mba(self):
         self.mba.build_graph()
@@ -366,41 +380,74 @@ class MbaTransformer(object):
 
     def process(self):
         pfn = self.mba.get_curfunc()  # type: func_t
-        if pfn.tailqty == 0:
-            return False
+        # if pfn.tailqty == 0:
+        #     return False
+        pfnRangeset = idaapi.rangeset_t()
+        idaapi.get_func_ranges(pfnRangeset, pfn)
+        pfnRanges = [(c.start_ea, c.end_ea) for c in pfnRangeset]
 
         # Func have tail chunks
-        tailRanges = [(pfnTail.start_ea, pfnTail.end_ea) for pfnTail in pfn.tails]
-        logger.info(f"Function has {len(tailRanges)} tails: {tailRanges}")
+        # tailRanges = [(pfnTail.start_ea, pfnTail.end_ea) for pfnTail in pfn.tails]
+        # logger.info(f"Function has {len(tailRanges)} tails: {tailRanges}")
 
         #############################################################################
         # Phase I - Prepare
         #  Prepare the mba for process & find out the needed function mblock
         #############################################################################
+
+        def findInlineCall():
+            # called addr that need to extract
+            neededTail = {}
+            for i in range(self.mba.qty):
+                curblk = self.mba.get_mblock(i)
+                curtail = curblk.tail  # type: minsn_t
+                if curtail and curtail.opcode == m_call:
+                    if curtail.l.t == mop_v:
+                        callAddr = curtail.l.g
+                        inranges = [r for r in pfnRanges if callAddr >= r[0] and callAddr < r[1]]
+                        assert len(inranges) <= 1
+                        if inranges:
+                            neededTail[i] = callAddr
+            return neededTail
+
+        if len(findInlineCall()) == 0:
+            logger.info("Not need us, returning...")
+            return
+
+
+        # We must do mba.build_graph first, as it will sometimes insert additional blocks
         logger.info("Preparing basic infos...")
         self.prepare_mba()
 
-        neededTail = {}
-        for i in range(self.mba.qty):
-            curblk = self.mba.get_mblock(i)
-            curtail = curblk.tail  # type: minsn_t
-            if curtail and curtail.opcode == m_call:
-                if curtail.l.t == mop_v:
-                    callAddr = curtail.l.g
-                    inranges = [r for r in tailRanges if callAddr >= r[0] and callAddr < r[1]]
-                    assert len(inranges) <= 1
-                    if inranges:
-                        neededTail[i] = inranges[0]
+        neededTail = findInlineCall()
+        logger.info("We need these tails: %s", neededTail)
 
-        logger.info("We need these tails: ", neededTail)
+        blkStarts = {self.mba.get_mblock(i).start: i for i in range(self.mba.qty)}
+        # we make sure all call target has its corresponding mblock
+        # note: we assume that all in-func call should goto one block's beginning
+        assert all( c in blkStarts for c in set(neededTail.values()) )
+
         tailBlocks = {}
-        for r in set(neededTail.values()):
-            tailBlocks[r] = []
-            for cur in range(self.mba.qty):
-                curblock = self.mba.get_mblock(cur)  # type: mblock_t
-                if is_mblock_in_range(curblock, [r]):
-                    tailBlocks[r].append(curblock)
-            tailBlocks[r].sort(key=lambda blk: abs(blk.start - r[0]))
+        for callAddr in set(neededTail.values()):
+            tailBlocks[callAddr] = []
+
+            relateBlkIds = []
+            def findAllRelateBlk(blk: mblock_t):
+                if blk.serial in relateBlkIds:
+                    return
+                relateBlkIds.append(blk.serial)
+                succblks = self.mba.get_succ(blk)
+                isEnd = len(succblks) == 0
+                if blk.tail and blk.tail.is_tailcall():
+                    isEnd = True
+                if not isEnd:
+                    for succblk in succblks:
+                        findAllRelateBlk(succblk)
+
+            curCallStart = self.mba.get_mblock(blkStarts[callAddr])
+            findAllRelateBlk(curCallStart)
+            tailBlocks[callAddr] = [self.mba.get_mblock(c) for c in relateBlkIds]
+            logger.info("  Extracted tail: %x - %s" % (callAddr, relateBlkIds))
 
         # All function tail should have corresponding MB
         assert all(c for c in tailBlocks.values())
@@ -410,16 +457,16 @@ class MbaTransformer(object):
         #
         #############################################################################
         logger.info("Processing inline calls...")
-        for callblkId, callRange in neededTail.items():
+        for callblkId, callAddr in neededTail.items():
             callblk = self.mba.get_mblock(callblkId)  # type: mblock_t
             returnblk = self.mba.get_mblock(callblkId + 1)  # type: mblock_t
-            tailBlock = tailBlocks[callRange]
-            logger.info("   Processing call: %d %s", callblkId, callRange)
+            tailBlock = tailBlocks[callAddr]
+            logger.info("  Processing call: %d %x", callblkId, callAddr)
             newTailBlock, newEnds = copy_blocks(self.mba, tailBlock)
 
             newTailBlockStart = newTailBlock[tailBlock[0].serial]
 
-            logger.info("Patching call blk %d goto %d", callblk.serial, tailBlock[0].serial)
+            logger.info("    Patching call blk %d goto %d", callblk.serial, newTailBlockStart.serial)
             patch_last_goto(callblk, newTailBlockStart, True)
 
             # patch newblock's end to
@@ -427,7 +474,7 @@ class MbaTransformer(object):
             assert newEnds.jcnd_target == []
             assert newEnds.fallthrough == []
             for end in newEnds.ret:
-                logger.info("Patching end blk %d goto %d", end.serial, returnblk.serial)
+                logger.info("    Patching end blk %d goto %d", end.serial, returnblk.serial)
                 patch_last_goto(end, returnblk, True)
 
 
@@ -503,23 +550,29 @@ class ConvertToTailHandler(idaapi.action_handler_t):
     def activate(self, ctx):
         cur_ea = idaapi.get_screen_ea()
         pfnChunk = idaapi.get_fchunk(cur_ea) # type: func_t
-        if pfnChunk.flags & idaapi.FUNC_TAIL:
-            # Already a tail, refuse to continue
-            idaapi.warning("Current pos is already a function tail!")
-            return 0
 
         curRange = (pfnChunk.start_ea, pfnChunk.end_ea)
         print("Converting chunk %x-%x to tail!" % curRange)
-        funcs = set()
+        parent_funcs = set()
         for xref in idautils.XrefsTo(curRange[0], 0):
             if not xref.iscode:
                 continue
 
-            funcs.add(idaapi.get_func(xref.frm).start_ea)
+            try:
+                parent_funcs.add(idaapi.get_func(xref.frm).start_ea)
+            except:
+                pass
 
-        idaapi.del_func(cur_ea)
-        for fun in funcs:
-            print("idaapi.append_func_tail(idaapi.get_func(0x%x), 0x%x, 0x%x)" % (fun, curRange[0], curRange[1]))
+        if pfnChunk.flags & idaapi.FUNC_TAIL:
+            # Already a tail, refuse to continue
+            idaapi.warning("Current pos is already a function tail, Not Deleting!")
+            # return 0
+        else:
+            idaapi.del_func(cur_ea)
+        for fun in parent_funcs:
+            if not idaapi.add_cref(fun, curRange[0], XREF_USER | fl_JN):
+                print("    Failed to add_cref in function %x" % fun)
+            # print("idaapi.append_func_tail(idaapi.get_func(0x%x), 0x%x, 0x%x)" % (fun, curRange[0], curRange[1]))
             if not idaapi.append_func_tail(idaapi.get_func(fun), *curRange):
                 print("    Failed to append tail to function %x" % fun)
         return 1
